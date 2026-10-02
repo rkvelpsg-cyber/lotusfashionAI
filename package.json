@@ -1,0 +1,30 @@
+{
+  "name": "lotus-fashion-ai-standee",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "predev": "node scripts/optimize-media.mjs",
+    "dev": "next dev",
+    "prebuild": "node scripts/optimize-media.mjs",
+    "build": "next build",
+    "optimize-media": "node scripts/optimize-media.mjs",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:photo-quality": "node --experimental-strip-types --test tests/photo-quality.test.mjs",
+    "test:session": "node --experimental-strip-types --test tests/session-management.test.mjs"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^1.0.1",
+    "fashn": "^0.15.0",
+    "next": "^15.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}
