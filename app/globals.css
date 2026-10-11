@@ -1000,6 +1000,17 @@ button:disabled {
   object-fit: cover;
   transform: scaleX(-1);
 }
+.cameraVideo.cameraVideoMobile {
+  object-fit: contain;
+  transform: none;
+}
+.cameraVideo.cameraVideoMobile.cameraVideoMirrored {
+  transform: scaleX(-1);
+}
+.cameraNotice {
+  color: var(--show-highlight) !important;
+  font-size: 13px !important;
+}
 .cameraCopy p,
 .previewActions p {
   color: var(--show-muted);

@@ -5,11 +5,18 @@ import { catalog, Group } from "@/lib/catalog";
 import { fileToDataUrl } from "@/lib/image";
 import { getProductsForCategory, Product } from "@/data/products";
 import {
+  canAcceptPhotoQualityResult,
   getLivePositioningHint,
-  PhotoValidationUnavailableError,
   validatePhoto as validateCustomerPhoto,
 } from "@/lib/photo-quality";
 import type { PhotoQualityResult } from "@/lib/photo-quality";
+import {
+  findRearCamera,
+  getCameraFacing,
+  isMobileOrTablet,
+  openCameraStream,
+  stopMediaStream,
+} from "@/lib/camera";
 import { GenerationRequestGuard } from "@/lib/generation-guard";
 import {
   describeOptimization,
@@ -107,7 +114,13 @@ export default function ShowroomExperience() {
   const [loading, setLoading] = useState(false);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [cameraError, setCameraError] = useState("");
+  const [cameraNotice, setCameraNotice] = useState("");
   const [cameraRetry, setCameraRetry] = useState(0);
+  const [mobileCamera, setMobileCamera] = useState(false);
+  const [cameraFacingMode, setCameraFacingMode] =
+    useState<"environment" | "user">("environment");
+  const [cameraDeviceId, setCameraDeviceId] = useState("");
+  const [cameraMirrored, setCameraMirrored] = useState(false);
   const [cameraResolution, setCameraResolution] = useState("");
   const [positioningHint, setPositioningHint] = useState(
     "Stand naturally and look at the camera.",
@@ -117,8 +130,6 @@ export default function ShowroomExperience() {
   );
   const [photoQualityError, setPhotoQualityError] = useState("");
   const [photoOptimizationNotice, setPhotoOptimizationNotice] = useState("");
-  const [photoCheckFallbackAvailable, setPhotoCheckFallbackAvailable] =
-    useState(false);
   const [photoChecking, setPhotoChecking] = useState(false);
   const [error, setError] = useState("");
   const [sessionWarningSeconds, setSessionWarningSeconds] = useState<number | null>(null);
@@ -161,8 +172,15 @@ export default function ShowroomExperience() {
 
     let cancelled = false;
     setCameraError("");
+    setCameraNotice("");
     setCameraResolution("");
     setPositioningHint("Stand naturally and look at the camera.");
+    const useMobileCamera = isMobileOrTablet(
+      navigator.userAgent,
+      navigator.platform,
+      navigator.maxTouchPoints,
+    );
+    setMobileCamera(useMobileCamera);
     if (!navigator.mediaDevices?.getUserMedia) {
       setCameraError(
         window.isSecureContext
@@ -176,56 +194,43 @@ export default function ShowroomExperience() {
     }
 
     async function openCamera() {
-      let stream: MediaStream | undefined;
-      let lastError: unknown;
-      const constraints: MediaStreamConstraints[] = [
-        {
-          video: {
-            facingMode: { ideal: "user" },
-            width: { ideal: 1920 },
-            height: { ideal: 1080 },
-          },
-          audio: false,
-        },
-        {
-          video: {
-            facingMode: { ideal: "user" },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
-          audio: false,
-        },
-        { video: true, audio: false },
-      ];
-
-      for (const constraint of constraints) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(constraint);
-          break;
-        } catch (error: unknown) {
-          lastError = error;
-          const name = error instanceof Error ? error.name : "";
-          if (
-            name === "NotAllowedError" ||
-            name === "PermissionDeniedError" ||
-            name === "SecurityError"
-          ) {
-            break;
-          }
-        }
-      }
-
-      if (!stream) {
-        if (!cancelled) setCameraError(getCameraErrorMessage(lastError));
-        return;
-      }
+      const result = await openCameraStream(
+        navigator.mediaDevices,
+        useMobileCamera,
+        cameraFacingMode,
+        useMobileCamera ? cameraDeviceId || undefined : undefined,
+      );
+      const { stream } = result;
 
       if (cancelled) {
-        stream.getTracks().forEach((track) => track.stop());
+        stopMediaStream(stream);
         return;
       }
 
       streamRef.current = stream;
+      setCameraNotice(result.notice);
+      let devices: MediaDeviceInfo[] = [];
+      if (useMobileCamera) {
+        try {
+          devices = await navigator.mediaDevices.enumerateDevices();
+        } catch {
+          if (!cancelled) {
+            setCameraNotice(
+              "Camera details are unavailable. You can still use this camera, switch cameras, or upload a photo.",
+            );
+          }
+        }
+      }
+      const actualFacing = getCameraFacing(
+        stream,
+        devices,
+        useMobileCamera ? result.facingMode : "user",
+      );
+      if (cancelled) {
+        stopMediaStream(stream);
+        return;
+      }
+      if (!cancelled) setCameraMirrored(actualFacing === "user");
       for (const track of stream.getTracks()) {
         track.addEventListener("ended", handleCameraDisconnected);
       }
@@ -255,11 +260,9 @@ export default function ShowroomExperience() {
       }, 12000);
     }
 
-    void openCamera().catch(() => {
+    void openCamera().catch((cameraStartError: unknown) => {
       if (!cancelled) {
-        setCameraError(
-          "The camera could not be started. Check browser and system camera permissions, then try again or upload a photo.",
-        );
+        setCameraError(getCameraErrorMessage(cameraStartError, useMobileCamera));
       }
     });
 
@@ -267,12 +270,50 @@ export default function ShowroomExperience() {
       cancelled = true;
       stopCamera();
     };
-  }, [cameraRetry, step]);
+  }, [cameraDeviceId, cameraFacingMode, cameraRetry, step]);
 
-  function getCameraErrorMessage(error: unknown) {
+  async function switchCamera() {
+    if (!mobileCamera || !navigator.mediaDevices?.enumerateDevices) return;
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cameras = devices.filter((device) => device.kind === "videoinput");
+      if (cameras.length < 2) {
+        setCameraNotice("No other camera is available on this device.");
+        return;
+      }
+
+      const currentId = streamRef.current
+        ?.getVideoTracks()[0]
+        ?.getSettings().deviceId;
+      const currentIndex = cameras.findIndex(
+        (device) => device.deviceId === currentId,
+      );
+      const nextCamera = cameras[(currentIndex + 1) % cameras.length];
+      const rearCamera = findRearCamera([nextCamera]);
+      const facingMode =
+        rearCamera || !/\b(front|user|selfie)\b/i.test(nextCamera.label)
+          ? "environment"
+          : "user";
+
+      stopCamera();
+      setCameraError("");
+      setCameraNotice("");
+      setCameraResolution("");
+      setCameraFacingMode(facingMode);
+      setCameraDeviceId(nextCamera.deviceId);
+    } catch {
+      setCameraNotice(
+        "We couldn't switch cameras. You can continue with the current camera or upload a photo.",
+      );
+    }
+  }
+
+  function getCameraErrorMessage(error: unknown, mobile = mobileCamera) {
     const name = error instanceof Error ? error.name : "";
     if (name === "NotAllowedError" || name === "PermissionDeniedError") {
-      return "Camera permission is blocked. In Chrome, click the camera icon beside the address bar and allow access for this site. Also check Windows Settings → Privacy & security → Camera, then try again.";
+      return mobile
+        ? "Camera permission is blocked. Allow camera access for this site in your browser and device settings, then try again or upload a photo."
+        : "Camera permission is blocked. In Chrome, click the camera icon beside the address bar and allow access for this site. Also check Windows Settings → Privacy & security → Camera, then try again.";
     }
     if (name === "SecurityError") {
       return "The browser blocked camera access for this page. Open the showroom on HTTPS or localhost and allow camera permission.";
@@ -525,6 +566,10 @@ export default function ShowroomExperience() {
   }
 
   function chooseProduct(product: Product) {
+    setCameraFacingMode("environment");
+    setCameraDeviceId("");
+    setCameraNotice("");
+    setCameraMirrored(false);
     setSelectedProduct(product);
     setError("");
     if (acceptedHistory.length > 1 && currentAcceptedImage) {
@@ -548,6 +593,10 @@ export default function ShowroomExperience() {
       );
       setProductFile(file);
       setProductPreview(preview);
+      setCameraFacingMode("environment");
+      setCameraDeviceId("");
+      setCameraNotice("");
+      setCameraMirrored(false);
       setSelectedProduct({
         id: `UPLOAD-${categoryId}`,
         code: "",
@@ -629,8 +678,10 @@ export default function ShowroomExperience() {
     canvas.height = video.videoHeight;
     const context = canvas.getContext("2d");
     if (!context) return;
-    context.translate(canvas.width, 0);
-    context.scale(-1, 1);
+    if (cameraMirrored) {
+      context.translate(canvas.width, 0);
+      context.scale(-1, 1);
+    }
     context.drawImage(video, 0, 0, canvas.width, canvas.height);
     const frame = canvas.toDataURL("image/jpeg", 0.92);
     if (!needsPayloadOptimization(frame)) {
@@ -657,7 +708,6 @@ export default function ShowroomExperience() {
     setCapturedImage(image);
     setPhotoQuality(null);
     setPhotoQualityError("");
-    setPhotoCheckFallbackAvailable(false);
     setPhotoChecking(true);
     setStep("preview");
     void validateCustomerPhoto(image, categoryId)
@@ -675,9 +725,6 @@ export default function ShowroomExperience() {
             ? validationError.message
             : "Photo checks are unavailable. Please retake or upload another photo.",
         );
-        setPhotoCheckFallbackAvailable(
-          validationError instanceof PhotoValidationUnavailableError,
-        );
       })
       .finally(() => {
         if (validationId === photoValidationIdRef.current) {
@@ -686,33 +733,20 @@ export default function ShowroomExperience() {
       });
   }
 
-  function usePhoto(allowPhotoChecksOnly = false) {
+  function usePhoto() {
     if (!capturedImage) return;
     if (acceptedHistory.length > 1 && capturedImage === currentAcceptedImage) {
       setError("");
       void generate(currentAcceptedImage);
       return;
     }
-    const explicitFallback =
-      allowPhotoChecksOnly &&
-      (photoCheckFallbackAvailable ||
-        (photoQuality?.state === "unavailable" &&
-          photoQuality.canUsePhotoChecksOnly));
-    if (
-      !explicitFallback &&
-      (!photoQuality ||
-        photoQuality.state === "retake" ||
-        photoQuality.state === "unavailable")
-    ) {
-      return;
-    }
+    if (!canAcceptPhotoQualityResult(photoQuality) || photoQualityError) return;
     setOriginalCustomerImage(capturedImage);
     setCurrentAcceptedImage(capturedImage);
     setAcceptedHistory([capturedImage]);
     setPersonPreview(capturedImage);
     setError("");
     setPhotoQualityError("");
-    setPhotoCheckFallbackAvailable(false);
     void generate(capturedImage);
   }
 
@@ -858,7 +892,6 @@ export default function ShowroomExperience() {
     setPhotoQuality(null);
     setPhotoQualityError("");
     setPhotoOptimizationNotice("");
-    setPhotoCheckFallbackAvailable(false);
     setPhotoChecking(false);
   }
 
@@ -950,7 +983,10 @@ export default function ShowroomExperience() {
           videoRef={videoRef}
           canvasRef={canvasRef}
           cameraError={cameraError}
+          cameraNotice={cameraNotice}
           cameraResolution={cameraResolution}
+          cameraMirrored={cameraMirrored}
+          mobileCamera={mobileCamera}
           positioningHint={positioningHint}
           countdown={countdown}
           selectedProduct={selectedProduct}
@@ -961,6 +997,7 @@ export default function ShowroomExperience() {
             setCameraError("");
             setCameraRetry((attempt) => attempt + 1);
           }}
+          onSwitchCamera={switchCamera}
           onCameraMetadata={() => {
             const video = videoRef.current;
             if (video?.videoWidth && video.videoHeight) {
@@ -980,7 +1017,6 @@ export default function ShowroomExperience() {
           photoQuality={photoQuality}
           photoQualityError={photoQualityError}
           optimizationNotice={photoOptimizationNotice}
-          photoCheckFallbackAvailable={photoCheckFallbackAvailable}
           photoChecking={photoChecking}
           isAcceptedLook={
             acceptedHistory.length > 1 &&
@@ -997,12 +1033,10 @@ export default function ShowroomExperience() {
             setCapturedImage("");
             setPhotoQuality(null);
             setPhotoQualityError("");
-            setPhotoCheckFallbackAvailable(false);
             setPhotoChecking(false);
             setStep("camera");
           }}
           onUse={usePhoto}
-          onUsePhotoChecksOnly={() => usePhoto(true)}
         />
       )}
       {step === "generating" && <GeneratingScreen />}
@@ -1493,7 +1527,10 @@ function CameraScreen({
   videoRef,
   canvasRef,
   cameraError,
+  cameraNotice,
   cameraResolution,
+  cameraMirrored,
+  mobileCamera,
   positioningHint,
   countdown,
   selectedProduct,
@@ -1501,12 +1538,16 @@ function CameraScreen({
   onCapture,
   onUpload,
   onRetryCamera,
+  onSwitchCamera,
   onCameraMetadata,
 }: {
   videoRef: React.RefObject<HTMLVideoElement | null>;
   canvasRef: React.RefObject<HTMLCanvasElement | null>;
   cameraError: string;
+  cameraNotice: string;
   cameraResolution: string;
+  cameraMirrored: boolean;
+  mobileCamera: boolean;
   positioningHint: string;
   countdown: number | null;
   selectedProduct: Product | undefined;
@@ -1514,6 +1555,7 @@ function CameraScreen({
   onCapture: () => void;
   onUpload: (event: ChangeEvent<HTMLInputElement>) => void;
   onRetryCamera: () => void;
+  onSwitchCamera: () => void;
   onCameraMetadata: () => void;
 }) {
   return (
@@ -1541,7 +1583,7 @@ function CameraScreen({
                 autoPlay
                 muted
                 playsInline
-                className="cameraVideo"
+                className={`cameraVideo${mobileCamera ? " cameraVideoMobile" : ""}${cameraMirrored ? " cameraVideoMirrored" : ""}`}
                 onLoadedMetadata={onCameraMetadata}
               />
               {!cameraResolution && (
@@ -1567,6 +1609,16 @@ function CameraScreen({
           <p className="positioningHint" aria-live="polite">
             {positioningHint}
           </p>
+          {cameraNotice && (
+            <p className="cameraNotice" role="status" aria-live="polite">
+              {cameraNotice}
+            </p>
+          )}
+          {mobileCamera && (
+            <button className="outlineButton" onClick={onSwitchCamera}>
+              SWITCH CAMERA
+            </button>
+          )}
           {cameraResolution && (
             <span className="cameraResolution">
               Camera photo: {cameraResolution}
@@ -1605,34 +1657,28 @@ function PreviewScreen({
   photoQuality,
   photoQualityError,
   optimizationNotice,
-  photoCheckFallbackAvailable,
   photoChecking,
   isAcceptedLook,
   selectedProduct,
   onBack,
   onRetake,
   onUse,
-  onUsePhotoChecksOnly,
 }: {
   image: string;
   error: string;
   photoQuality: PhotoQualityResult | null;
   photoQualityError: string;
   optimizationNotice: string;
-  photoCheckFallbackAvailable: boolean;
   photoChecking: boolean;
   isAcceptedLook: boolean;
   selectedProduct: Product | undefined;
   onBack: () => void;
   onRetake: () => void;
   onUse: () => void;
-  onUsePhotoChecksOnly: () => void;
 }) {
   const canUsePhoto =
     isAcceptedLook ||
-    (photoQuality !== null &&
-      (photoQuality.state === "ready" ||
-        photoQuality.state === "adjustment"));
+    canAcceptPhotoQualityResult(photoQuality);
 
   return (
     <>
@@ -1666,23 +1712,15 @@ function PreviewScreen({
               role="alert"
               aria-live="assertive"
             >
-              <strong>Photo check unavailable</strong>
+              <strong>This photo can&apos;t be used</strong>
               <span>{photoQualityError}</span>
-              {photoCheckFallbackAvailable && (
-                <span>
-                  You may retake the photo or explicitly continue without photo
-                  quality checks.
-                </span>
-              )}
             </div>
           ) : photoQuality ? (
             <div
               className={`photoQualityStatus ${
                 photoQuality.state === "ready"
                   ? "qualityReady"
-                  : photoQuality.state === "retake"
-                    ? "qualityRetake"
-                    : "qualityAdjustment"
+                  : "qualityAdjustment"
               }`}
               role="status"
               aria-live="polite"
@@ -1690,9 +1728,7 @@ function PreviewScreen({
               <strong>
                 {photoQuality.state === "ready"
                   ? "Ready for AI"
-                  : photoQuality.state === "retake"
-                    ? "Retake required"
-                    : "Adjustment recommended"}
+                  : "Optional suggestions"}
               </strong>
               <span>
                 Photo dimensions: {photoQuality.width} × {photoQuality.height}
@@ -1703,43 +1739,17 @@ function PreviewScreen({
               {!isAcceptedLook && optimizationNotice && (
                 <span>{optimizationNotice}</span>
               )}
-              {photoQuality.poseUnavailable && (
-                <span>
-                  Body visibility could not be checked. You can retake this
-                  photo or continue with photo checks only.
-                </span>
-              )}
+              <span>You can continue with this photo or retake it.</span>
             </div>
           ) : null}
           {error && <p className="customerError">{error}</p>}
-          {(photoQuality?.canUsePhotoChecksOnly ||
-            (photoQualityError && photoCheckFallbackAvailable)) &&
-          !isAcceptedLook ? (
-            <button
-              className="goldButton"
-              onClick={onUsePhotoChecksOnly}
-              disabled={
-                photoChecking ||
-                (Boolean(photoQualityError) && !photoCheckFallbackAvailable)
-              }
-            >
-              {photoQualityError
-                ? "CONTINUE WITHOUT PHOTO CHECKS"
-                : "CONTINUE WITH PHOTO CHECKS ONLY"}
-            </button>
-          ) : (
-            <button
-              className="goldButton"
-              onClick={onUse}
-              disabled={
-                photoChecking ||
-                Boolean(photoQualityError) ||
-                !canUsePhoto
-              }
-            >
-              USE THIS PHOTO
-            </button>
-          )}
+          <button
+            className="goldButton"
+            onClick={onUse}
+            disabled={photoChecking || Boolean(photoQualityError) || !canUsePhoto}
+          >
+            USE THIS PHOTO
+          </button>
           <button className="outlineButton" onClick={onRetake}>
             RETAKE
           </button>

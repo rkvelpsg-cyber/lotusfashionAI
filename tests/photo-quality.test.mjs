@@ -3,9 +3,11 @@ import test from "node:test";
 import {
   analyzeImageStatistics,
   assessPose,
+  canAcceptPhotoQualityResult,
   createPhotoQualityResult,
   getFramingRequirement,
   measureImagePixels,
+  validatePhoto,
 } from "../lib/photo-quality.ts";
 
 const size = 256;
@@ -76,17 +78,18 @@ test("clear, well-framed full-body photo is ready", () => {
 test("dark photo asks for improved lighting", () => {
   const statistics = measureImagePixels(makeRaster(() => 20), size, size);
   const findings = analyzeImageStatistics(1920, 1080, statistics);
-  assert.ok(findings.some((finding) => finding.message.includes("too dark")));
+  assert.ok(findings.some((finding) => finding.message.includes("well-lit")));
+  assert.ok(findings.every((finding) => finding.state === "adjustment"));
 });
 
-test("heavily overexposed photo requires a retake", () => {
+test("heavily overexposed photo receives an optional warning", () => {
   const statistics = measureImagePixels(makeRaster(() => 250), size, size);
   const findings = analyzeImageStatistics(1920, 1080, statistics);
-  assert.ok(findings.some((finding) => finding.message.includes("too bright")));
-  assert.ok(findings.some((finding) => finding.state === "retake"));
+  assert.ok(findings.some((finding) => finding.message.includes("glare")));
+  assert.ok(findings.every((finding) => finding.state === "adjustment"));
 });
 
-test("uneven background exposure recommends adjustment without automatic rejection", () => {
+test("low resolution and uneven exposure only recommend adjustments", () => {
   const findings = analyzeImageStatistics(1920, 1080, {
     meanLuminance: 130,
     darkPixelRatio: 0.8,
@@ -94,22 +97,30 @@ test("uneven background exposure recommends adjustment without automatic rejecti
     laplacianVariance: 100,
   });
   assert.ok(findings.some((finding) => finding.state === "adjustment"));
-  assert.equal(findings.some((finding) => finding.state === "retake"), false);
+  assert.equal(
+    analyzeImageStatistics(320, 240, {
+      meanLuminance: 130,
+      darkPixelRatio: 0,
+      brightPixelRatio: 0,
+      laplacianVariance: 100,
+    }).some((finding) => finding.state === "retake"),
+    false,
+  );
 });
 
-test("blurry photo is rejected", () => {
+test("blurry photo receives an optional steady-camera warning", () => {
   const statistics = measureImagePixels(makeRaster(() => 128), size, size);
   const findings = analyzeImageStatistics(1920, 1080, statistics);
-  assert.ok(findings.some((finding) => finding.message.includes("blurry")));
-  assert.ok(findings.some((finding) => finding.state === "retake"));
+  assert.ok(findings.some((finding) => finding.message.includes("steady")));
+  assert.ok(findings.every((finding) => finding.state === "adjustment"));
 });
 
-test("cropped full-body photo fails ankle visibility", () => {
+test("cropped full-body photo recommends better framing without rejection", () => {
   const landmarks = poseLandmarks();
   landmarks[27] = { x: 0.43, y: 1.05, visibility: 0.2 };
   landmarks[28] = { x: 0.57, y: 1.05, visibility: 0.2 };
   const result = assessPose("saree", landmarks);
-  assert.equal(result.findings[0].state, "retake");
+  assert.equal(result.findings[0].state, "adjustment");
   assert.ok(result.findings[0].message.includes("full body"));
 });
 
@@ -136,7 +147,7 @@ test("accessory checks focus on the relevant visible region", () => {
   );
   assert.equal(
     assessPose("shoes", landmarks).findings.some(
-      (finding) => finding.state === "retake",
+    (finding) => finding.state === "adjustment",
     ),
     true,
   );
@@ -151,7 +162,7 @@ test("uploaded photo raster uses the same local analysis without alteration", ()
   assert.equal(findings.some((finding) => finding.state === "retake"), false);
 });
 
-test("unavailable pose model requires an explicit photo-check-only fallback", () => {
+test("unavailable pose checks remain advisory and photo acceptance is not blocked", () => {
   const result = createPhotoQualityResult({
     width: 1920,
     height: 1080,
@@ -162,6 +173,7 @@ test("unavailable pose model requires an explicit photo-check-only fallback", ()
   });
   assert.equal(result.state, "unavailable");
   assert.equal(result.canUsePhotoChecksOnly, true);
+  assert.equal(canAcceptPhotoQualityResult(result), true);
 
   const failedImageResult = createPhotoQualityResult({
     width: 1920,
@@ -171,5 +183,33 @@ test("unavailable pose model requires an explicit photo-check-only fallback", ()
     imageFindings: [{ state: "retake", message: "Blurry" }],
     poseUnavailable: true,
   });
-  assert.equal(failedImageResult.canUsePhotoChecksOnly, false);
+  assert.equal(failedImageResult.canUsePhotoChecksOnly, true);
+  assert.equal(canAcceptPhotoQualityResult(failedImageResult), true);
+  assert.equal(canAcceptPhotoQualityResult(null), false);
+});
+
+test("retake findings are downgraded to optional warnings in the final result", () => {
+  const result = createPhotoQualityResult({
+    width: 320,
+    height: 240,
+    blurVariance: 1,
+    meanLuminance: 20,
+    imageFindings: [{ state: "retake", message: "For better results, stand in a well-lit area." }],
+    poseFindings: [{ state: "retake", message: "A full-body photograph is recommended." }],
+  });
+  assert.equal(result.state, "adjustment");
+  assert.ok(result.findings.every((finding) => finding.state === "adjustment"));
+  assert.equal(canAcceptPhotoQualityResult(result), true);
+  assert.equal(canAcceptPhotoQualityResult({ ...result, state: "retake" }), true);
+});
+
+test("empty and unsupported images remain technical validation errors", async () => {
+  await assert.rejects(
+    validatePhoto(new Blob([], { type: "image/jpeg" }), "saree"),
+    /non-empty JPG, PNG or WEBP/i,
+  );
+  await assert.rejects(
+    validatePhoto(new Blob(["not an image"], { type: "image/gif" }), "saree"),
+    /non-empty JPG, PNG or WEBP/i,
+  );
 });

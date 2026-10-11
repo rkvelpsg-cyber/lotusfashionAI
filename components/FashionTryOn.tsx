@@ -4,7 +4,7 @@ import { ChangeEvent, useMemo, useRef, useState } from "react";
 import { catalog, Group } from "@/lib/catalog";
 import { fileToDataUrl } from "@/lib/image";
 import {
-  PhotoValidationUnavailableError,
+  canAcceptPhotoQualityResult,
   validatePhoto as validateCustomerPhoto,
 } from "@/lib/photo-quality";
 import type { PhotoQualityResult } from "@/lib/photo-quality";
@@ -26,8 +26,6 @@ export default function FashionTryOn() {
     null,
   );
   const [photoQualityError, setPhotoQualityError] = useState("");
-  const [photoCheckFallbackAvailable, setPhotoCheckFallbackAvailable] =
-    useState(false);
   const [photoChecking, setPhotoChecking] = useState(false);
   const [photoQualityCategoryId, setPhotoQualityCategoryId] = useState("");
   const [productPreview, setProductPreview] = useState("");
@@ -68,7 +66,6 @@ export default function FashionTryOn() {
     const validationId = ++photoValidationIdRef.current;
     setPhotoQuality(null);
     setPhotoQualityError("");
-    setPhotoCheckFallbackAvailable(false);
     setPhotoChecking(true);
     setPhotoQualityCategoryId(nextCategoryId);
     try {
@@ -80,9 +77,6 @@ export default function FashionTryOn() {
           validationError instanceof Error
             ? validationError.message
             : "Photo checks are unavailable. Please choose another photo.",
-        );
-        setPhotoCheckFallbackAvailable(
-          validationError instanceof PhotoValidationUnavailableError,
         );
       }
     } finally {
@@ -110,7 +104,6 @@ export default function FashionTryOn() {
       setPendingCustomerPhoto("");
       setPhotoQuality(null);
       setPhotoQualityError("");
-      setPhotoCheckFallbackAvailable(false);
       setPhotoChecking(true);
       setResult("");
     }
@@ -209,28 +202,13 @@ export default function FashionTryOn() {
     setCredits(null);
   }
 
-  function acceptCustomerPhoto(photoChecksOnly = false) {
-    if (!pendingCustomerPhoto) return;
-    const explicitFallback =
-      photoChecksOnly &&
-      (photoCheckFallbackAvailable ||
-        (photoQuality?.state === "unavailable" &&
-          photoQuality.canUsePhotoChecksOnly));
+  function acceptCustomerPhoto() {
     if (
-      photoQualityError &&
-      !(photoChecksOnly && photoCheckFallbackAvailable)
-    ) {
-      return;
-    }
-    if (
+      !pendingCustomerPhoto ||
+      photoQualityError ||
       photoQualityCategoryId !== selected?.id ||
-      (!explicitFallback &&
-        (!photoQuality ||
-          photoQuality.state === "retake" ||
-          photoQuality.state === "unavailable"))
-    ) {
-      return;
-    }
+      !canAcceptPhotoQualityResult(photoQuality)
+    ) return;
     setOriginalCustomerImage(pendingCustomerPhoto);
     setCurrentAcceptedImage(pendingCustomerPhoto);
     setAcceptedHistory([pendingCustomerPhoto]);
@@ -238,7 +216,6 @@ export default function FashionTryOn() {
     setPendingCustomerPhoto("");
     setPhotoQuality(null);
     setPhotoQualityError("");
-    setPhotoCheckFallbackAvailable(false);
     setError("");
   }
 
@@ -280,7 +257,6 @@ export default function FashionTryOn() {
     setPendingCustomerPhoto("");
     setPhotoQuality(null);
     setPhotoQualityError("");
-    setPhotoCheckFallbackAvailable(false);
     setPhotoChecking(false);
     setPhotoQualityCategoryId("");
     setProductPreview("");
@@ -373,7 +349,7 @@ export default function FashionTryOn() {
             }
             description={
               pendingCustomerPhoto
-                ? "Review the photo quality before using it to start a new look."
+                ? "Optional quality suggestions are shown below; they never prevent using a valid photo."
                 : acceptedHistory.length > 1
                 ? "This accepted AI result will be used for the next item."
                 : "Use a clear front-facing or full-body customer photo."
@@ -428,7 +404,7 @@ export default function FashionTryOn() {
               </>
             ) : photoQualityError ? (
               <>
-                <strong>Photo check unavailable</strong>
+                <strong>This photo can&apos;t be used</strong>
                 <span>{photoQualityError}</span>
               </>
             ) : photoQuality && photoQualityCategoryId === selected?.id ? (
@@ -436,9 +412,7 @@ export default function FashionTryOn() {
                 <strong>
                   {photoQuality.state === "ready"
                     ? "Ready for AI"
-                    : photoQuality.state === "retake"
-                      ? "Retake required"
-                      : "Adjustment recommended"}
+                    : "Optional suggestions"}
                 </strong>
                 <span>
                   Photo dimensions: {photoQuality.width} × {photoQuality.height}
@@ -448,43 +422,21 @@ export default function FashionTryOn() {
                     {finding.message}
                   </span>
                 ))}
-                {photoQuality.poseUnavailable && (
-                  <span>
-                    Body visibility could not be checked. You can choose another
-                    photo or continue with photo checks only.
-                  </span>
-                )}
+                <span>You can continue with this photo or choose another.</span>
               </>
             ) : null}
-            {photoQuality?.canUsePhotoChecksOnly ||
-            (photoQualityError && photoCheckFallbackAvailable) ? (
-              <button
-                className="primary"
-                onClick={() => acceptCustomerPhoto(true)}
-                disabled={
-                  photoChecking ||
-                  (Boolean(photoQualityError) && !photoCheckFallbackAvailable)
-                }
-              >
-                {photoQualityError
-                  ? "Continue without photo checks"
-                  : "Continue with photo checks only"}
-              </button>
-            ) : (
-              <button
-                className="primary"
-                onClick={() => acceptCustomerPhoto()}
-                disabled={
-                  photoChecking ||
-                  Boolean(photoQualityError) ||
-                  photoQualityCategoryId !== selected?.id ||
-                  !photoQuality ||
-                  !["ready", "adjustment"].includes(photoQuality.state)
-                }
-              >
-                Use this photo
-              </button>
-            )}
+            <button
+              className="primary"
+              onClick={acceptCustomerPhoto}
+              disabled={
+                photoChecking ||
+                Boolean(photoQualityError) ||
+                photoQualityCategoryId !== selected?.id ||
+                !canAcceptPhotoQualityResult(photoQuality)
+              }
+            >
+              Use this photo
+            </button>
           </section>
         )}
 

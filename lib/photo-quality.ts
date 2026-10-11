@@ -39,8 +39,6 @@ export type PhotoQualityResult = {
   canUsePhotoChecksOnly: boolean;
 };
 
-export class PhotoValidationUnavailableError extends Error {}
-
 type ImageStatistics = {
   meanLuminance: number;
   darkPixelRatio: number;
@@ -143,14 +141,6 @@ export function analyzeImageStatistics(
   const shortSide = Math.min(width, height);
 
   if (
-    longSide < PHOTO_QUALITY_CONFIG.minimumLongSide ||
-    shortSide < PHOTO_QUALITY_CONFIG.minimumShortSide
-  ) {
-    findings.push({
-      state: "retake",
-      message: "This photo is too small. Please use a higher-resolution photo.",
-    });
-  } else if (
     longSide < PHOTO_QUALITY_CONFIG.preferredWidth ||
     shortSide < PHOTO_QUALITY_CONFIG.preferredHeight
   ) {
@@ -164,8 +154,8 @@ export function analyzeImageStatistics(
     statistics.meanLuminance <= PHOTO_QUALITY_CONFIG.darkMeanLuminance
   ) {
     findings.push({
-      state: "retake",
-      message: "This photo is too dark. Please improve the lighting and retake it.",
+      state: "adjustment",
+      message: "For better results, stand in a well-lit area.",
     });
   } else if (
     statistics.meanLuminance < 65 ||
@@ -181,8 +171,8 @@ export function analyzeImageStatistics(
     statistics.meanLuminance >= PHOTO_QUALITY_CONFIG.overexposedMeanLuminance
   ) {
     findings.push({
-      state: "retake",
-      message: "This photo is too bright. Please reduce the glare and retake it.",
+      state: "adjustment",
+      message: "Avoid bright glare if possible.",
     });
   } else if (
     statistics.meanLuminance > 215 ||
@@ -196,8 +186,8 @@ export function analyzeImageStatistics(
 
   if (statistics.laplacianVariance < PHOTO_QUALITY_CONFIG.rejectBlurVariance) {
     findings.push({
-      state: "retake",
-      message: "This photo looks blurry. Hold still and retake it.",
+      state: "adjustment",
+      message: "Try to keep the camera steady.",
     });
   } else if (statistics.laplacianVariance < PHOTO_QUALITY_CONFIG.warnBlurVariance) {
     findings.push({
@@ -217,8 +207,8 @@ export function assessPose(
     return {
       findings: [
         {
-          state: "retake",
-          message: "We could not see you clearly. Stand in view of the camera and try again.",
+          state: "adjustment",
+          message: "A full-body photograph is recommended.",
         },
       ],
     };
@@ -241,8 +231,8 @@ export function assessPose(
 
   if (framing.landmarks.some((index) => !visible(index))) {
     findings.push({
-      state: "retake",
-      message: `Make sure ${framing.label} is visible in the photo.`,
+      state: "adjustment",
+      message: `For best results, include ${framing.label}.`,
     });
   }
 
@@ -308,16 +298,16 @@ export function createPhotoQualityResult({
   positioningHint?: string;
   poseUnavailable?: boolean;
 }): PhotoQualityResult {
-  const findings = [...imageFindings, ...(poseFindings ?? [])];
-  const hasRetakeFinding = findings.some((finding) => finding.state === "retake");
+  const findings = [...imageFindings, ...(poseFindings ?? [])].map((finding) => ({
+    ...finding,
+    state: "adjustment" as const,
+  }));
   const hasAdjustmentFinding = findings.some(
     (finding) => finding.state === "adjustment",
   );
 
   return {
-    state: hasRetakeFinding
-      ? "retake"
-      : poseUnavailable
+    state: poseUnavailable
         ? "unavailable"
         : hasAdjustmentFinding
           ? "adjustment"
@@ -329,8 +319,14 @@ export function createPhotoQualityResult({
     findings,
     positioningHint,
     poseUnavailable,
-    canUsePhotoChecksOnly: poseUnavailable && !hasRetakeFinding,
+    canUsePhotoChecksOnly: poseUnavailable,
   };
+}
+
+export function canAcceptPhotoQualityResult(
+  result: PhotoQualityResult | null,
+) {
+  return result !== null;
 }
 
 export function measureImagePixels(
@@ -464,50 +460,81 @@ export async function validatePhoto(
   source: string | Blob,
   categoryId: string,
 ): Promise<PhotoQualityResult> {
-  let bitmap: ImageBitmap | undefined;
+  let decodedImage: ImageBitmap | HTMLImageElement | undefined;
   let canvas: HTMLCanvasElement | undefined;
   try {
-    const blob =
-      typeof source === "string" ? await (await fetch(source)).blob() : source;
-    if (typeof createImageBitmap !== "function") {
-      throw new PhotoValidationUnavailableError(
-        "Photo checks aren't supported on this device. You may retake or explicitly continue without them.",
-      );
+    let blob: Blob;
+    if (typeof source === "string") {
+      const response = await fetch(source);
+      if (!response.ok) throw new Error("The photo could not be loaded.");
+      blob = await response.blob();
+    } else {
+      blob = source;
     }
-    bitmap = await createImageBitmap(blob);
-    const width = bitmap.width;
-    const height = bitmap.height;
+    if (
+      !blob.size ||
+      !["image/jpeg", "image/png", "image/webp"].includes(blob.type)
+    ) {
+      throw new Error("Choose a non-empty JPG, PNG or WEBP photo.");
+    }
+    if (typeof createImageBitmap === "function") {
+      try {
+        decodedImage = await createImageBitmap(blob);
+      } catch {
+        decodedImage = undefined;
+      }
+    }
+    if (!decodedImage) {
+      const objectUrl = URL.createObjectURL(blob);
+      try {
+        decodedImage = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error("The photo could not be decoded."));
+          image.src = objectUrl;
+        });
+      } finally {
+        URL.revokeObjectURL(objectUrl);
+      }
+    }
+    const width = decodedImage.width;
+    const height = decodedImage.height;
+    if (!width || !height) throw new Error("The photo has invalid dimensions.");
     const scale = Math.min(1, 512 / Math.max(width, height));
     canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(width * scale));
     canvas.height = Math.max(1, Math.round(height * scale));
     const context = canvas.getContext("2d", { willReadFrequently: true });
     if (!context) {
-      throw new PhotoValidationUnavailableError(
-        "Photo checks aren't supported on this device. You may retake or explicitly continue without them.",
-      );
+      return createPhotoQualityResult({
+        width,
+        height,
+        blurVariance: 0,
+        meanLuminance: 0,
+        imageFindings: [
+          { state: "adjustment", message: "Photo quality suggestions are unavailable on this device." },
+        ],
+        poseUnavailable: true,
+      });
     }
-    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    context.drawImage(decodedImage, 0, 0, canvas.width, canvas.height);
     let pixels: Uint8ClampedArray;
     try {
       pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
     } catch {
-      throw new PhotoValidationUnavailableError(
-        "Photo checks aren't supported on this device. You may retake or explicitly continue without them.",
-      );
-    }
-    const statistics = measureImagePixels(pixels, canvas.width, canvas.height);
-    const imageFindings = analyzeImageStatistics(width, height, statistics);
-
-    if (imageFindings.some((finding) => finding.state === "retake")) {
       return createPhotoQualityResult({
         width,
         height,
-        blurVariance: statistics.laplacianVariance,
-        meanLuminance: statistics.meanLuminance,
-        imageFindings,
+        blurVariance: 0,
+        meanLuminance: 0,
+        imageFindings: [
+          { state: "adjustment", message: "Photo quality suggestions are unavailable on this device." },
+        ],
+        poseUnavailable: true,
       });
     }
+    const statistics = measureImagePixels(pixels, canvas.width, canvas.height);
+    const imageFindings = analyzeImageStatistics(width, height, statistics);
 
     try {
       const pose = assessPose(categoryId, await detectPoseLandmarks(canvas));
@@ -531,12 +558,13 @@ export async function validatePhoto(
       });
     }
   } catch (error) {
-    if (error instanceof PhotoValidationUnavailableError) {
-      throw error;
-    }
-    throw new Error("We could not check this photo. Please choose another photo or retake it.");
+    throw new Error(
+      error instanceof Error && error.message
+        ? error.message
+        : "This photo could not be opened. Choose a valid JPG, PNG or WEBP image.",
+    );
   } finally {
-    bitmap?.close();
+    if (decodedImage && "close" in decodedImage) decodedImage.close();
     if (canvas) {
       canvas.width = 0;
       canvas.height = 0;
